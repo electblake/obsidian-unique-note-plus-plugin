@@ -1,16 +1,40 @@
-import { App, Editor, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, Setting, TFile } from 'obsidian';
+import { App, Editor, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, Setting, TAbstractFile, TFile, TFolder } from 'obsidian';
 import * as fs from 'fs'
 import * as path from 'path'
 // Remember to rename these classes and interfaces!
 
+
+enum TagPlacement {
+	'frontmatter' = 'frontmatter',
+	'append' = 'append'
+}
 interface UniqueNotePlusSettings {
-	foo: string;
+	recursiveFolders: boolean;
+	folderAsTag: boolean;
+	tagPlacement: TagPlacement
 }
 
 const DEFAULT_ZK_PREFIXER_FORMAT = 'YYYYMMDDHHmm'
 
 const DEFAULT_SETTINGS: UniqueNotePlusSettings = {
-	foo: 'default'
+	recursiveFolders: false,
+	folderAsTag: false,
+	tagPlacement: TagPlacement.append
+}
+
+const slugify = (str: string) => str
+	.toLowerCase()
+	.trim()
+	.replace(/[^\w\s-]/g, '')
+	.replace(/[\s_-]+/g, '-')
+	.replace(/^-+|-+$/g, '')
+
+function isFolder(file: TAbstractFile): file is TFolder {
+	return file instanceof TFolder
+}
+
+function isFile(file: TAbstractFile): file is TFile {
+	return file instanceof TFile
 }
 
 export default class UniqueNotePlusPlugin extends Plugin {
@@ -53,8 +77,10 @@ export default class UniqueNotePlusPlugin extends Plugin {
 		return settings
 	}
 
-	async convertToUniqueNote() {
-		const file = this.currentFile()
+	async convertToUniqueNote(file?: TFile) {
+		if (!file) {
+			file = this.currentFile()
+		}
 		const title = file?.name
 		const ctime = window.moment(file?.stat.ctime)
 		if (!title || !ctime) {
@@ -64,18 +90,45 @@ export default class UniqueNotePlusPlugin extends Plugin {
 		}
 
 		const settings = this.getZkPrefixerSettings()
+		const pluginSettings = this.settings
 
 		// create new file name
 		const targetFile = ctime.format(settings.format) + ' ' + title
-		this.app.fileManager.renameFile(file, path.join(settings.folder, targetFile))
-	}
+		if (!file) {
+			console.error('Failed to Load Unique Notes Settings', { file })
+			new Notice('Failed to Load Unique Notes Settings, check console for details')
+			return
+		}
 
-	async getUniqueNoteSettings() {
-		return this.app.vault.adapter.list(this.app.vault.configDir)
+		// add folder as tag to frontmatter
+		if (pluginSettings.folderAsTag) {
+			const folderTag = slugify(file?.parent.name)
+
+			if (pluginSettings.tagPlacement === TagPlacement.frontmatter) {
+				await this.app.fileManager.processFrontMatter(file, (frontMatter) => {
+					frontMatter = frontMatter || {}
+					if (file?.parent.name) {
+						const tags = new Set<string>(frontMatter.tags || [])
+						tags.add(slugify(file?.parent.name))
+						frontMatter.tags = Array.from(tags)
+					}
+					return frontMatter
+				})
+			}
+			if (pluginSettings.tagPlacement === TagPlacement.append) {
+				// @ts-ignore
+				const root = this.app.vault.adapter.basePath
+				fs.appendFileSync(path.join(root, file.path), `\n\n#${folderTag}`)
+			}
+		}
+
+		await this.app.fileManager.renameFile(file, path.join(settings.folder, targetFile))
+		
 	}
 
 	async onload() {
 		await this.loadSettings();
+		this.addSettingTab(new SampleSettingTab(this.app, this));
 
 		this.addCommand({
 			id: 'unique-note-plus-convert',
@@ -85,10 +138,55 @@ export default class UniqueNotePlusPlugin extends Plugin {
 			}
 		})
 
+		const pluginSettings = this.settings
 
-		this.registerEvent(this.app.vault.on('create', () => {
-      console.log('a new file has entered the arena')
-    }));
+		// register file-menu right-click option
+		this.registerEvent(
+      this.app.workspace.on("file-menu", (menu, object) => {
+				const file = isFile(object) ? object as TFile : null
+				const folder = isFolder(object) ? object as TFolder : null
+				if (file) {
+					// selected single file
+					console.log('file-menu', 'single file?', file)
+					menu.addItem((item) => {
+						item
+							.setTitle("Convert to Unique Note")
+							.setIcon("document")
+							.onClick(async () => {
+								console.log('file', file)
+								await this.convertToUniqueNote(file as TFile)
+							});
+					});
+				}
+
+				function childrenFiles(files: TFile[], folder: TFolder): TFile[] {
+					folder.children.forEach((child) => {
+						if (isFile(child)) {
+							files.push(child)
+						} else if (isFolder(child) && pluginSettings.recursiveFolders) {
+							files = childrenFiles(files, child)
+						}
+					})
+					return files
+				}
+
+				if (folder) {
+					menu.addItem((item) => {
+						item
+							.setTitle("Convert folder children to Unique Notes")
+							.setIcon("document")
+							.onClick(async () => {
+								if (folder && folder.children.length) {
+									const files = childrenFiles([], folder)
+									for (const file of files) {
+										await this.convertToUniqueNote(file as TFile)
+									}
+								}
+							});
+					});
+				}
+      })
+    );
 
 		// // This creates an icon in the left ribbon.
 		// const ribbonIconEl = this.addRibbonIcon('dice', 'Sample Plugin', (evt: MouseEvent) => {
@@ -138,9 +236,6 @@ export default class UniqueNotePlusPlugin extends Plugin {
 		// 		}
 		// 	}
 		// });
-
-		// This adds a settings tab so the user can configure various aspects of the plugin
-		this.addSettingTab(new SampleSettingTab(this.app, this));
 
 		// // If the plugin hooks up any global DOM events (on parts of the app that doesn't belong to this plugin)
 		// // Using this function will automatically remove the event listener when this plugin is disabled.
@@ -193,22 +288,56 @@ class SampleSettingTab extends PluginSettingTab {
 	}
 
 	display(): void {
-		const {containerEl} = this;
+		const { containerEl } = this;
+    const { folderAsTag, recursiveFolders, tagPlacement } = this.plugin.settings;
 
 		containerEl.empty();
 
-		containerEl.createEl('h2', {text: 'Settings for my awesome plugin.'});
+		containerEl.createEl('h2', {text: 'Unique Note Plus Settings'});
+		containerEl.createEl("hr");
+		containerEl.createEl('h3', {text: 'Convert Settings'});
 
 		new Setting(containerEl)
-			.setName('Setting #1')
-			.setDesc('It\'s a secret')
-			.addText(text => text
-				.setPlaceholder('Enter your secret')
-				.setValue(this.plugin.settings.foo)
-				.onChange(async (value) => {
-					console.log('Secret: ' + value);
-					this.plugin.settings.foo = value;
+			.setName("Convert - Recursively select children in folders")
+			.setDesc(
+				"When converting a folder, recursively select children"
+			)
+			.addToggle((setting) =>
+				setting.setValue(recursiveFolders).onChange(async (value) => {
+					this.plugin.settings.recursiveFolders = value;
 					await this.plugin.saveSettings();
-				}));
+					this.display();
+				})
+			);
+		new Setting(containerEl)
+				.setName('Convert - Folder as tag')
+				.setDesc('When converting a note, add the folder name as a tag')
+				.addToggle((setting) =>
+					setting.setValue(folderAsTag).onChange(async (value) => {
+						this.plugin.settings.folderAsTag = value;
+						await this.plugin.saveSettings();
+						this.display();
+					})
+				);
+		if (folderAsTag) {
+			new Setting(containerEl)
+				.setName("Convert - Folder as Tag - Placement Rule")
+				.setDesc(
+					"Frontmatter means adding tag to frontmatter. " +
+						"Append updates note content with tag at end of note. "
+				)
+				.addDropdown((setting) =>
+					setting
+					.addOption(TagPlacement.append, "Append")	
+					.addOption(TagPlacement.frontmatter, "Frontmatter")
+						.setDisabled(!folderAsTag)
+						.setValue(tagPlacement)
+						.onChange(async (value) => {
+							this.plugin.settings.tagPlacement = value as TagPlacement;
+							await this.plugin.saveSettings();
+							this.display();
+						})
+				);
+		}
 	}
 }
