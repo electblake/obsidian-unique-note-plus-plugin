@@ -1,7 +1,7 @@
 {
-	"name": "obsidian-unique-notes-advanced-plugin",
+	"name": "obsidian-unique-note-plus-plugin",
 	"version": "1.0.0",
-	"description": "Unique Notes - Advanced",
+	"description": "Unique Note Plus",
 	"main": "main.js",
 	"scripts": {
 		"dev": "node esbuild.config.mjs",
